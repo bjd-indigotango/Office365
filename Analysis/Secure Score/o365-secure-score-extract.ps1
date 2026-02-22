@@ -14,6 +14,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$TenantDomain, # The primary domain of the target Microsoft 365 tenant
     [string]$DataFile = "", # Optional: Output file path for JSON data
+    [int]$ScoreHistoryCount = 5, # Optional: Number of historical Secure Score records to retrieve (default 5)
     [switch]$Compact # Optional: Also output a compact summary file for AI/analysis
 )
 
@@ -29,12 +30,105 @@ function Write-Info($msg) { Write-Host "[INFO] $msg" -ForegroundColor Green }
 function Write-Warn($msg) { Write-Host "[WARN] $msg" -ForegroundColor Yellow }
 function Write-Err($msg) { Write-Host "[ERROR] $msg" -ForegroundColor Red }
 
+# Helper to save partial data as checkpoint (enables recovery from mid-run failures)
+# Overwrites a single _partial.json file on each stage; deleted on successful completion
+function Save-PartialData {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$SecurityData,
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath,
+        [Parameter(Mandatory = $true)]
+        [string]$Stage # Stage name for logging (e.g., "secure-score", "controls")
+    )
+    
+    try {
+        $checkpointFile = $OutputPath -replace '\.json$', "_partial.json"
+        $SecurityData | ConvertTo-Json -Depth 10 | Out-File -FilePath $checkpointFile -Encoding UTF8 -Force
+        $fileSize = (Get-Item $checkpointFile).Length
+        $fileSizeKB = [math]::Round($fileSize / 1KB, 2)
+        Write-Debug "[Save-PartialData] Partial data updated at stage '${Stage}': $checkpointFile ($fileSizeKB KB)"
+        Write-Host "  [Recovery Point] ${Stage}: data saved ($fileSizeKB KB)" -ForegroundColor DarkGray
+    } catch {
+        Write-Warn "Could not save partial data at stage '${Stage}': $($_.Exception.Message)"
+    }
+}
 
-# Helper to fetch all pages from a Graph API endpoint, handling paging and errors
+
+# Helper to invoke a single Graph API request with retry logic for transient failures
+function Invoke-MgGraphRequestWithRetry {
+    param(
+        [string]$Uri, # The Graph API endpoint to call
+        [int]$MaxRetries = 3, # Maximum retry attempts for transient failures
+        [int]$InitialBackoffMs = 1000 # Initial backoff in milliseconds (exponential)
+    )
+
+    $retryCount = 0
+    $requestSuccess = $false
+    $result = $null
+
+    while ($retryCount -le $MaxRetries -and -not $requestSuccess) {
+        try {
+            Write-Debug "[Invoke-MgGraphRequestWithRetry] Invoking request to $Uri (attempt $($retryCount + 1)/$($MaxRetries + 1))"
+            $result = Invoke-MgGraphRequest -Uri $Uri -Method GET -ErrorAction Stop
+            $requestSuccess = $true
+        } catch {
+            $httpStatusCode = $null
+            $isTransient = $false
+            $errorMessage = $_.Exception.Message
+
+            # Try to extract HTTP status code
+            if ($_.Exception.Response) {
+                $httpStatusCode = [int]$_.Exception.Response.StatusCode
+                Write-Debug "[Invoke-MgGraphRequestWithRetry] HTTP Status Code: $httpStatusCode"
+            }
+
+            # Determine if error is transient
+            if ($httpStatusCode -in @(408, 429, 500, 503, 504)) {
+                $isTransient = $true
+                Write-Host "  ⚠️  Transient error detected (HTTP $httpStatusCode): $errorMessage" -ForegroundColor Yellow
+            }
+
+            if ($isTransient -and $retryCount -lt $MaxRetries) {
+                # Check for Retry-After header on 429 (throttling)
+                $retryAfterParsed = $false
+                $backoffSec = $null
+                if ($httpStatusCode -eq 429 -and $_.Exception.Response.Headers['Retry-After']) {
+                    $retryAfter = $_.Exception.Response.Headers['Retry-After']
+                    if ([int]::TryParse($retryAfter, [ref]$backoffSec)) {
+                        Write-Host "     Using API-provided Retry-After: ${backoffSec}s" -ForegroundColor Magenta
+                        $retryAfterParsed = $true
+                    }
+                }
+                # Fall back to exponential backoff if no Retry-After header
+                if (!$retryAfterParsed) {
+                    $backoffMs = $InitialBackoffMs * [Math]::Pow(2, $retryCount)
+                    $backoffSec = [Math]::Round($backoffMs / 1000, 1)
+                }
+                $retryCount++
+                Write-Host "     Retrying in ${backoffSec}s (attempt $retryCount of $MaxRetries)..." -ForegroundColor Cyan
+                if ($retryAfterParsed) {
+                    Start-Sleep -Seconds $backoffSec
+                } else {
+                    Start-Sleep -Milliseconds $backoffMs
+                }
+            } else {
+                # Non-transient error or max retries exceeded
+                Write-Err "Graph request failed: $errorMessage"
+                Write-Debug "[Invoke-MgGraphRequestWithRetry] Exception: $($_.Exception | Out-String)"
+                throw
+            }
+        }
+    }
+
+    return $result
+}
+
 function Invoke-GraphCollection {
     param(
         [string]$Uri, # The Graph API endpoint to call
-        [switch]$UseMgGraph # Use Microsoft Graph PowerShell SDK
+        [int]$MaxRetries = 3, # Maximum retry attempts for transient failures
+        [int]$InitialBackoffMs = 1000 # Initial backoff in milliseconds (exponential)
     )
 
     $results = @()
@@ -49,12 +143,7 @@ function Invoke-GraphCollection {
             $pageCount++
             $pageStart = Get-Date
             Write-Debug "[Invoke-GraphCollection] Fetching page $pageCount from $next"
-            if ($UseMgGraph) {
-                $resp = Invoke-MgGraphRequest -Uri $next -Method GET -ErrorAction Stop
-            } else {
-                Write-Err "Graph request requires Connect-MgGraph connection"
-                return @()
-            }
+            $resp = Invoke-MgGraphRequestWithRetry -Uri $next -MaxRetries $MaxRetries -InitialBackoffMs $InitialBackoffMs
             $pageElapsed = ((Get-Date) - $pageStart).TotalSeconds
             $itemCount = if ($resp.value) { $resp.value.Count } else { 0 }
             if ($resp.value) { $results += $resp.value }
@@ -69,7 +158,7 @@ function Invoke-GraphCollection {
             Write-Host ""
             Write-Host "=== Graph API Error Details ===" -ForegroundColor Red
             
-            # Try to parse error details from the error object
+            # Parse error details from the error object
             if ($_.ErrorDetails.Message) {
                 try {
                     $errorObj = $_.ErrorDetails.Message | ConvertFrom-Json
@@ -90,34 +179,10 @@ function Invoke-GraphCollection {
                 }
             }
             
-            # Method 2: Try to read response stream if error details are not present
-            if (-not $_.ErrorDetails.Message) {
-                try {
-                    $result = $_.Exception.Response.GetResponseStream()
-                    $reader = New-Object System.IO.StreamReader($result)
-                    $responseBody = $reader.ReadToEnd()
-                    if ($responseBody) {
-                        try {
-                            $errorObj = $responseBody | ConvertFrom-Json
-                            if ($errorObj.error) {
-                                Write-Err "Error Code: $($errorObj.error.code)"
-                                Write-Err "Error Message: $($errorObj.error.message)"
-                            }
-                        } catch {
-                            Write-Err "Response: $responseBody"
-                        }
-                    }
-                } catch {
-                    Write-Warn "Could not read error response body"
-                }
-            }
-            
             Write-Host "================================" -ForegroundColor Red
             Write-Host ""
-            
-            # Log the URI that failed for troubleshooting
             Write-Err "Failed URI: $next"
-            break
+            $next = $null # Exit pagination loop
         }
     }
 
@@ -126,8 +191,9 @@ function Invoke-GraphCollection {
 
 function Get-SecureScoreData {
     # Retrieves the latest Secure Score and history for the tenant
-    Write-Debug "[Get-SecureScoreData] Collecting Secure Score data"
-    $scores = Invoke-GraphCollection -Uri "https://graph.microsoft.com/beta/security/secureScores?`$top=5&`$orderby=createdDateTime%20desc" -UseMgGraph
+    param([int]$HistoryCount = 5) # Number of historical records to retrieve
+    Write-Debug "[Get-SecureScoreData] Collecting Secure Score data (retrieving $HistoryCount historical records)"
+    $scores = Invoke-GraphCollection -Uri "https://graph.microsoft.com/beta/security/secureScores?`$top=$HistoryCount&`$orderby=createdDateTime%20desc"
     $latest = $scores | Sort-Object createdDateTime -Descending | Select-Object -First 1
     return [pscustomobject]@{
         Latest = $latest
@@ -138,9 +204,13 @@ function Get-SecureScoreData {
 function Get-SecureScoreControls {
     # Retrieves all Secure Score controls and highlights open/important ones
     Write-Debug "[Get-SecureScoreControls] Collecting Secure Score control profiles"
-    $controls = Invoke-GraphCollection -Uri "https://graph.microsoft.com/beta/security/secureScoreControlProfiles?`$top=200" -UseMgGraph
+    $controls = Invoke-GraphCollection -Uri "https://graph.microsoft.com/beta/security/secureScoreControlProfiles?`$top=200"
     # Flag likely gaps so they can be prioritized
-    $openControls = $controls | Where-Object { $_.controlStateUpdates.state -ne "completed" -and $_.tier -ne "informational" }
+    # Note: Check if ANY controlStateUpdates have state "completed"; if none, control is open
+    $openControls = $controls | Where-Object {
+        $_.tier -ne "informational" -and
+        ($_.controlStateUpdates | Where-Object { $_.state -eq "completed" }).Count -eq 0
+    }
     return [pscustomobject]@{
         All = $controls
         Open = $openControls
@@ -152,7 +222,7 @@ function Get-SecureScoreControls {
 function Get-ConditionalAccessPolicies {
     # Retrieves Conditional Access policies and strips verbose fields
     Write-Debug "[Get-ConditionalAccessPolicies] Collecting Conditional Access policies"
-    $policies = Invoke-GraphCollection -Uri "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?`$top=100" -UseMgGraph
+    $policies = Invoke-GraphCollection -Uri "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?`$top=100"
     $sanitized = $policies | ForEach-Object {
         [pscustomobject]@{
             DisplayName   = $_.displayName
@@ -173,7 +243,7 @@ function Get-SecurityDefaultsStatus {
     # Checks if Security Defaults are enabled for the tenant
     Write-Debug "[Get-SecurityDefaultsStatus] Checking security defaults status"
     try {
-        $policy = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy" -Method GET -ErrorAction Stop
+        $policy = Invoke-MgGraphRequestWithRetry -Uri "https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy"
         return $policy
     } catch {
         Write-Warn "Could not retrieve security defaults status: $($_.Exception.Message)"
@@ -184,35 +254,17 @@ function Get-SecurityDefaultsStatus {
 
 function Get-MfaRegistrationSummary {
     # Retrieves MFA registration summary for the last 30 days
+    # NOTE: This endpoint is currently only available in beta API, not v1.0
     Write-Debug "[Get-MfaRegistrationSummary] Collecting MFA registration summary"
     try {
-        # API requires a period argument, otherwise returns 400
-        $summary = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationSummary(period='D30')" -Method GET -ErrorAction Stop
+        # API requires a period argument (d1, d7, d30 supported)
+        # Endpoint: /reports/authenticationMethods/userRegistrationActivity(period='{period}')
+        $summary = Invoke-MgGraphRequestWithRetry -Uri "https://graph.microsoft.com/beta/reports/authenticationMethods/userRegistrationActivity(period='d30')"
         return $summary.value
-     } catch {
+    } catch {
         Write-Warn "Could not retrieve MFA registration summary: $($_.Exception.Message)"
         return @()
     }
-}
-
-
-function Get-TenantInfoFromGraph {
-    # (Unused) Helper to get tenant info from Graph
-    param([string]$GraphToken)
-    if ([string]::IsNullOrWhiteSpace($GraphToken)) {
-        # Using MgGraph context instead
-        try {
-            $org = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/organization?`$top=1" -Method GET -ErrorAction SilentlyContinue
-            if ($org.value -and $org.value.Count -gt 0) {
-                return [pscustomobject]@{
-                    OrgDisplayName = $org.value[0].displayName
-                    TenantId = $org.value[0].id
-                }
-            }
-        } catch {}
-        return $null
-    }
-    return $null
 }
 
 
@@ -238,7 +290,7 @@ function Convert-SecureScoreDataSummary {
         SecureScoreControls = @{
             TotalCount = @($SecurityData.SecureScoreControls.All).Count
             OpenCount = @($SecurityData.SecureScoreControls.Open).Count
-            TopOpen = $SecurityData.SecureScoreControls.TopOpen | Select-Object -Property id, title, rank, implementationCost, userImpact, threats, tier, remediation, controlCategory, actionUrl, maxScore, score -First 25
+            TopOpen = $SecurityData.SecureScoreControls.TopOpen | Select-Object -Property id, title, rank, implementationCost, userImpact, threats, tier, remediation, controlCategory, actionUrl, maxScore, score
         }
         # Keep CA policies but remove verbose internal fields
         ConditionalAccess = $SecurityData.ConditionalAccess | Select-Object -Property DisplayName, State, CreatedDate, ModifiedDate, Conditions, GrantControls, SessionControls -First 50
@@ -271,15 +323,16 @@ if (-not $TenantDomain) {
 if (-not $DataFile) {
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $sanitizedDomain = $TenantDomain -replace '[^a-zA-Z0-9]', '-'
-    $parentDir = Split-Path -Parent (Get-Location).Path
-    if (-not $parentDir) { $parentDir = Split-Path -Parent $PSScriptRoot }
-    $DataFile = Join-Path $parentDir "${sanitizedDomain}_ss_${timestamp}.json"
+    $outputDir = (Get-Location).Path
+    if (-not $outputDir) { $outputDir = $PSScriptRoot }
+    $DataFile = Join-Path $outputDir "${sanitizedDomain}_ss_${timestamp}.json"
     Write-Debug "[Main] Auto-generated data file path: $DataFile"
 }
 
 
 Write-Info "Target Tenant: $TenantDomain"
 Write-Info "Output File: $DataFile"
+Write-Info "Score History Records: $ScoreHistoryCount"
 Write-Host ""
 
 
@@ -307,7 +360,7 @@ try {
         Write-Host "  Current Account: $($context.Account)" -ForegroundColor Gray
         # Try to get tenant domain to compare
         try {
-            $org = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/organization" -Method GET -ErrorAction Stop
+            $org = Invoke-MgGraphRequestWithRetry -Uri "https://graph.microsoft.com/v1.0/organization"
             $currentDomain = $org.value[0].verifiedDomains | Where-Object { $_.isDefault -eq $true } | Select-Object -ExpandProperty name
             if ($currentDomain) {
                 Write-Host "  Current Domain: $currentDomain" -ForegroundColor Gray
@@ -331,7 +384,7 @@ try {
     if ($needsConnection) {
         Write-Info "Connecting to Microsoft Graph..."
         Write-Debug "[Main] Connecting to Microsoft Graph with scopes: $($requiredScopes -join ', ')"
-        Connect-MgGraph -Scopes $requiredScopes -NoWelcome -ErrorAction Stop
+        Connect-MgGraph -Tenant $TenantDomain -Scopes $requiredScopes -NoWelcome -ErrorAction Stop
         $context = Get-MgContext
     }
     Write-Host ""
@@ -350,7 +403,7 @@ Write-Host ""
 Write-Host "Testing Microsoft Graph connectivity..." -ForegroundColor Cyan
 try {
     $testStart = Get-Date
-    $null = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/organization" -Method GET -ErrorAction Stop
+    $null = Invoke-MgGraphRequestWithRetry -Uri "https://graph.microsoft.com/v1.0/organization"
     $testElapsed = ((Get-Date) - $testStart).TotalMilliseconds
     Write-Host "  ✓ Graph API responding in $([math]::Round($testElapsed, 0))ms" -ForegroundColor Green
     if ($testElapsed -gt 5000) {
@@ -365,15 +418,34 @@ try {
 
 # ===================== DATA COLLECTION STEPS =====================
 
+# Initialize single security data object for progressive collection and saving
+Write-Debug "[Main] Initializing security data object"
+$securityData = [pscustomobject]@{
+    Tenant                 = $TenantDomain
+    CollectionDate         = $null # Will be set after all collection completes
+    TenantId               = $context.TenantId
+    CollectedBy            = $context.Account
+    SecureScore            = $null
+    SecureScoreControls    = $null
+    ConditionalAccess      = $null
+    SecurityDefaults       = $null
+    MfaRegistrationSummary = $null
+}
+Write-Debug "[Main] Initialized security data object"
+
 # 1. Secure Score
 Write-Host "" 
 Write-Host "[1/5] Collecting Secure Score data..." -ForegroundColor Cyan
 Write-Host "      This may take 10-30 seconds depending on tenant size" -ForegroundColor Gray
 $startTime = Get-Date
 Write-Debug "[Main] Starting Secure Score data collection"
-$secureScoreData = Get-SecureScoreData
+$secureScoreData = Get-SecureScoreData -HistoryCount $ScoreHistoryCount
 $elapsed = ((Get-Date) - $startTime).TotalSeconds
 Write-Host "      ✓ Completed in $([math]::Round($elapsed, 1)) seconds" -ForegroundColor Green
+
+# Update and save checkpoint
+$securityData.SecureScore = $secureScoreData
+Save-PartialData -SecurityData $securityData -OutputPath $DataFile -Stage "secure-score"
 
 # 2. Secure Score Controls
 Write-Host "" 
@@ -385,6 +457,10 @@ $controlProfiles = Get-SecureScoreControls
 $elapsed = ((Get-Date) - $startTime).TotalSeconds
 Write-Host "      ✓ Retrieved $(@($controlProfiles.All).Count) controls in $([math]::Round($elapsed, 1)) seconds" -ForegroundColor Green
 
+# Update and save checkpoint
+$securityData.SecureScoreControls = $controlProfiles
+Save-PartialData -SecurityData $securityData -OutputPath $DataFile -Stage "controls"
+
 # 3. Conditional Access Policies
 Write-Host "" 
 Write-Host "[3/5] Collecting Conditional Access policies..." -ForegroundColor Cyan
@@ -395,6 +471,10 @@ $elapsed = ((Get-Date) - $startTime).TotalSeconds
 $policyCount = if ($caPolicies) { @($caPolicies).Count } else { 0 }
 Write-Host "      ✓ Retrieved $policyCount policies in $([math]::Round($elapsed, 1)) seconds" -ForegroundColor Green
 
+# Update and save checkpoint
+$securityData.ConditionalAccess = $caPolicies
+Save-PartialData -SecurityData $securityData -OutputPath $DataFile -Stage "conditional-access"
+
 # 4. Security Defaults
 Write-Host "" 
 Write-Host "[4/5] Checking security defaults status..." -ForegroundColor Cyan
@@ -404,6 +484,10 @@ $securityDefaults = Get-SecurityDefaultsStatus
 $elapsed = ((Get-Date) - $startTime).TotalSeconds
 Write-Host "      ✓ Completed in $([math]::Round($elapsed, 1)) seconds" -ForegroundColor Green
 
+# Update and save checkpoint
+$securityData.SecurityDefaults = $securityDefaults
+Save-PartialData -SecurityData $securityData -OutputPath $DataFile -Stage "security-defaults"
+
 # 5. MFA Registration Summary
 Write-Host "" 
 Write-Host "[5/5] Collecting MFA registration summary..." -ForegroundColor Cyan
@@ -412,25 +496,19 @@ Write-Debug "[Main] Starting MFA registration summary collection"
 $mfaSummary = Get-MfaRegistrationSummary
 $elapsed = ((Get-Date) - $startTime).TotalSeconds
 Write-Host "      ✓ Completed in $([math]::Round($elapsed, 1)) seconds" -ForegroundColor Green
-Write-Host ""
 
+# Update and save final checkpoint (all data collected)
+$securityData.MfaRegistrationSummary = $mfaSummary
+Save-PartialData -SecurityData $securityData -OutputPath $DataFile -Stage "mfa-summary"
+Write-Host ""
 
 # ===================== OUTPUT & FINALIZATION =====================
 
 Write-Host ""
-Write-Info "Building security data object..."
-$securityData = [pscustomobject]@{
-    Tenant                 = $TenantDomain
-    CollectionDate         = (Get-Date).ToString('o')
-    TenantId               = $context.TenantId
-    CollectedBy            = $context.Account
-    SecureScore            = $secureScoreData
-    SecureScoreControls    = $controlProfiles
-    ConditionalAccess      = $caPolicies
-    SecurityDefaults       = $securityDefaults
-    MfaRegistrationSummary = $mfaSummary
-}
-Write-Debug "[Main] Security data object built"
+Write-Info "All data collected. Finalizing..."
+# Set collection completion timestamp
+$securityData.CollectionDate = (Get-Date).ToString('o')
+Write-Debug "[Main] Security data object finalized with collection timestamp"
 
 # Save full data file
 Write-Info "Saving full data to: $DataFile"
@@ -447,6 +525,7 @@ Write-Host ""
 
 # Save compact version if requested
 $compactFilePath = ""
+$compactSizeKB = 0
 if ($Compact) {
     Write-Info "Creating compact/summarized data for AI processing..."
     try {
@@ -494,9 +573,36 @@ if ($compactFilePath) {
 Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Green
 Write-Host ""
 
+# Clean up temporary partial data file on successful completion
+$partialFile = $DataFile -replace '\.json$', "_partial.json"
+if (Test-Path $partialFile) {
+    Remove-Item $partialFile -Force -ErrorAction SilentlyContinue
+    Write-Debug "[Main] Cleaned up temporary recovery file: $partialFile"
+}
+
 Write-Info "Data extraction completed successfully!"
 Write-Host "  Use the full file for detailed analysis and integration" -ForegroundColor Gray
 if ($compactFilePath) {
     Write-Host "  Use the compact file for AI analysis and systems with upload limits" -ForegroundColor Gray
 }
+Write-Host ""
+
+Write-Host ""
+Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "  Recovery Information (for future runs)" -ForegroundColor Cyan
+Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "  If the script fails during collection, a temporary recovery file" -ForegroundColor Gray
+Write-Host "  is maintained at:" -ForegroundColor Gray
+Write-Host "    • *_partial.json" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  This single recovery point is updated after each collection stage:" -ForegroundColor Gray
+Write-Host "    • secure-score" -ForegroundColor Gray
+Write-Host "    • controls" -ForegroundColor Gray
+Write-Host "    • conditional-access" -ForegroundColor Gray
+Write-Host "    • security-defaults" -ForegroundColor Gray
+Write-Host "    • mfa-summary" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  The file allows resumption if the script terminates prematurely." -ForegroundColor Gray
+Write-Host "  It is automatically deleted on successful completion." -ForegroundColor Gray
+Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
 Write-Host ""

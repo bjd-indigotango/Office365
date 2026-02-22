@@ -1,3 +1,5 @@
+#Requires -Modules ExchangeOnlineManagement
+
 #region Parameters
 <#
 USAGE:
@@ -48,7 +50,7 @@ param(
 )
 #endregion
 #region Script Defaults & Globals
-if (-not $MaxRetries) { $MaxRetries = 3 }
+Write-Host "Initializing Exchange Online extraction script..." -ForegroundColor Green
 if (-not $global:ErrorCount) { $global:ErrorCount = 0 }
 if (-not $global:WarningCount) { $global:WarningCount = 0 }
 if (-not $global:ErrorList) { $global:ErrorList = @() }
@@ -69,6 +71,8 @@ function Invoke-WithRetry {
         Category name for debug/error output.
     .PARAMETER Critical
         If set, treat failures as critical.
+    .OUTPUTS
+        [PSCustomObject] with properties: Success (bool), Data (object or $null), Critical (bool), Message (string)
     #>
     param(
         [Parameter(Mandatory)] [scriptblock]$Script,
@@ -77,13 +81,16 @@ function Invoke-WithRetry {
         [switch]$Critical
     )
     $attempt = 0
+    # Exponential backoff delays in seconds: supports up to 5 retry attempts
+    # If $MaxAttempts is increased beyond 5, ensure $delays array is extended accordingly
     $delays = @(2,4,6,8,10)
     $lastError = $null
     while ($attempt -lt $MaxAttempts) {
         try {
             $attempt++
             Write-Debug "[Invoke-WithRetry] Attempt $attempt for $Category."
-            return & $Script
+            $data = & $Script
+            return @{ Success = $true; Data = $data; Critical = $Critical; Message = "" }
         } catch {
             $lastError = $_.Exception.Message
             $retryable = ($lastError -match 'timeout|temporarily|rate limit|network|transient|unavailable|throttl|server busy|try again')
@@ -96,12 +103,13 @@ function Invoke-WithRetry {
             }
         }
     }
+    $msg = "${Category} collection failed after $MaxAttempts attempts: $lastError"
     if ($Critical) {
-        Write-Err "CRITICAL: ${Category} collection failed after $MaxAttempts attempts."
+        Write-Err "CRITICAL: $msg"
     } else {
-        Write-Warn "NON-CRITICAL: ${Category} collection failed after $MaxAttempts attempts."
+        Write-Warn "NON-CRITICAL: $msg"
     }
-    return $null
+    return @{ Success = $false; Data = $null; Critical = $Critical; Message = $msg }
 }
 
 function Write-Warn {
@@ -155,9 +163,16 @@ function Write-Stat {
     Write-Host $Message -ForegroundColor Magenta
     Write-Debug "[Write-Stat] $Message"
 }
+
+# Helper: Format time span for display
+function Format-TimeSpan {
+    param([TimeSpan]$ts)
+    if ($ts.TotalSeconds -lt 60) { return "{0:N1}s" -f $ts.TotalSeconds }
+    elseif ($ts.TotalMinutes -lt 60) { return "{0:N1}m" -f $ts.TotalMinutes }
+    else { return "{0:N1}h" -f $ts.TotalHours }
+}
 #endregion
 
-#Requires -Modules ExchangeOnlineManagement
 <#
 .SYNOPSIS
     Extracts Exchange Online configuration, security, and compliance settings to JSON files.
@@ -181,15 +196,6 @@ function Write-Stat {
 .PARAMETER JsonDepth
     Optional. JSON serialization depth to prevent truncation (default: 64).
 #>
-#>
-
-# Helper: Format time span for display
-function Format-TimeSpan {
-    param([TimeSpan]$ts)
-    if ($ts.TotalSeconds -lt 60) { return "{0:N1}s" -f $ts.TotalSeconds }
-    elseif ($ts.TotalMinutes -lt 60) { return "{0:N1}m" -f $ts.TotalMinutes }
-    else { return "{0:N1}h" -f $ts.TotalHours }
-}
 
 #region Output Directory
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -226,9 +232,9 @@ function Save-Json {
     )
     $isEmpty = $false
     $dataType = $null
-    if ($null -eq $Data -or $Data -eq $false) {
+    if ($null -eq $Data) {
         $isEmpty = $true
-        $dataType = if ($null -eq $Data) { "Null" } else { $Data.GetType().Name }
+        $dataType = "Null"
     } elseif ($Data -is [System.Collections.IEnumerable] -and $Data.GetType().Name -ne 'String') {
         $dataType = $Data.GetType().Name
         try {
@@ -267,11 +273,6 @@ function Save-Json {
 #region Extraction
 
 #region Connect to Exchange Online
-# Ensure ExchangeOnlineManagement module is available
-if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
-    Write-Err "ExchangeOnlineManagement module is not installed. Please install it with 'Install-Module ExchangeOnlineManagement'."
-    throw
-}
 Import-Module ExchangeOnlineManagement -ErrorAction SilentlyContinue
 
 function Test-ExchangeOnlineConnection {
@@ -402,10 +403,14 @@ foreach ($cat in @(
 Write-Host "" 
 #endregion
 
-$categories = @(
-    @{ Name = "Organization config";      Cmd = { Get-OrganizationConfig }; Desc = "General organization settings."; Critical = $true },
+$categories = @(    # NOTE: Some operations below use N+1 query patterns (like Mailbox permissions and Distribution group members)
+    # which are inherently slow at scale. For PowerShell 7+ environments, consider using ForEach-Object -Parallel:
+    #   Mailbox permissions (faster): Get-Mailbox -ResultSize Unlimited | ForEach-Object -Parallel { Get-MailboxPermission -Identity $_.Identity } -ThrottleLimit 10
+    #   Distribution groups (faster): Get-DistributionGroup | ForEach-Object -Parallel { $group = $_; [PSCustomObject]@{ Group = $group; Members = Get-DistributionGroupMember -Identity $group.Identity } } -ThrottleLimit 5
+    # For PowerShell 5.1, batching or filtering by common permissions is recommended to reduce the number of queries.
+        @{ Name = "Organization config";      Cmd = { Get-OrganizationConfig }; Desc = "General organization settings."; Critical = $true },
     @{ Name = "Mailboxes";                Cmd = { Get-Mailbox -ResultSize Unlimited | Select-Object * }; Desc = "Full mailbox details."; Critical = $true },
-    @{ Name = "Mailbox permissions";      Cmd = { Get-Mailbox -ResultSize Unlimited | ForEach-Object { Get-MailboxPermission -Identity $_.Identity } }; Desc = "Mailbox permissions."; Critical = $true },
+    @{ Name = "Mailbox permissions";      Cmd = { Get-Mailbox -ResultSize Unlimited | ForEach-Object { Get-MailboxPermission -Identity $_.Identity } }; Desc = "Mailbox permissions (N+1 query - may be slow for large tenants)."; Critical = $true },
     @{ Name = "Transport rules";          Cmd = { Get-TransportRule }; Desc = "Mail flow rules."; Critical = $true },
     @{ Name = "Retention policies";       Cmd = { Get-RetentionPolicy }; Desc = "Retention policies."; Critical = $false },
     @{ Name = "Retention policy tags";    Cmd = { Get-RetentionPolicyTag }; Desc = "Retention policy tags."; Critical = $false },
@@ -424,14 +429,10 @@ $categories = @(
     @{ Name = "OWA policies";             Cmd = { Get-OwaMailboxPolicy }; Desc = "OWA mailbox policies."; Critical = $false },
     @{ Name = "Anti-phishing policies";   Cmd = { Get-AntiPhishPolicy }; Desc = "Anti-phishing policies."; Critical = $true },
     @{ Name = "ATP policies";             Cmd = { Get-AtpPolicyForO365 }; Desc = "ATP (Advanced Threat Protection) policies for O365."; Critical = $true },
-    @{ Name = "Distribution groups";      Cmd = { Get-DistributionGroup | ForEach-Object { $group = $_; [PSCustomObject]@{ Group = $group; Members = Get-DistributionGroupMember -Identity $group.Identity } } }; Desc = "Distribution groups with members."; Critical = $false },
+    @{ Name = "Distribution groups";      Cmd = { Get-DistributionGroup | ForEach-Object { $group = $_; [PSCustomObject]@{ Group = $group; Members = Get-DistributionGroupMember -Identity $group.Identity } } }; Desc = "Distribution groups with members (N+1 query - may be slow for large tenants)."; Critical = $false },
     @{ Name = "Unified groups";           Cmd = { Get-UnifiedGroup | ForEach-Object { $group = $_; [PSCustomObject]@{ Group = $group; Members = Get-UnifiedGroupLinks -Identity $group.Identity -LinkType Members } } }; Desc = "Unified groups (Microsoft 365 Groups) with members."; Critical = $false }
 )
 
-$results = @{}
-$total = $categories.Count
-$swTotal = [System.Diagnostics.Stopwatch]::StartNew()
-$categoryStats = @{}
 $results = @{}
 $total = $categories.Count
 $swTotal = [System.Diagnostics.Stopwatch]::StartNew()
@@ -444,20 +445,26 @@ for ($i = 0; $i -lt $total; $i++) {
     Write-Host "────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
     Write-Host "→ $($cat.Name): $($cat.Desc)" -ForegroundColor Yellow
     $swCat = [System.Diagnostics.Stopwatch]::StartNew()
-    $data = Invoke-WithRetry -Script $cat.Cmd -MaxAttempts $MaxRetries -Category $cat.Name -Critical:($cat.Critical)
+    $result = Invoke-WithRetry -Script $cat.Cmd -MaxAttempts $MaxRetries -Category $cat.Name -Critical:($cat.Critical)
+    $data = $result.Data
+    $success = $result.Success
     $swCat.Stop()
     $duration = $swCat.Elapsed
     $count = Get-SafeCount $data
-    $success = ($null -ne $data)
+    
+    # Warn about slow N+1 query operations on large datasets
+    if ($success -and $count -gt 500 -and ($cat.Name -match 'Mailbox permissions|Distribution groups')) {
+        Write-Warn "$($cat.Name): Collected $count items in $($duration.TotalSeconds) seconds. N+1 query pattern is inherently slow at scale. For better performance on PowerShell 7+, consider using ForEach-Object -Parallel."
+    }
     $results[$cat.Name] = $data
     $global:CategoryTimings[$cat.Name] = Format-TimeSpan $duration
-    $categoryStats[$cat.Name] = @{ Count = $count; Duration = $duration.TotalSeconds; Success = $success; Critical = $cat.Critical }
+    $categoryStats[$cat.Name] = @{ Count = $count; Duration = $duration.TotalSeconds; Success = $success; Critical = $result.Critical }
     if ($success -and ($count -gt 0 -or $cat.Name -ne 'Transport rules')) {
         Write-Host ("  ✓ $($cat.Name): {0} item(s) collected in {1}" -f $count, (Format-TimeSpan $duration)) -ForegroundColor Green
     } elseif ($cat.Name -eq 'Transport rules' -and $count -eq 0) {
         Write-Info "  $($cat.Name): No transport rules found. Treated as informational only."
     } else {
-        if ($cat.Critical) {
+        if ($result.Critical) {
             Write-Host ("  ✗ $($cat.Name): FAILED (CRITICAL) in {0}" -f (Format-TimeSpan $duration)) -ForegroundColor Red
         } else {
             Write-Host ("  ✗ $($cat.Name): FAILED (non-critical) in {0}" -f (Format-TimeSpan $duration)) -ForegroundColor Yellow
@@ -475,7 +482,6 @@ Write-Host ""
 #endregion
 
 
-#region Assign Results
 #region Assign Results
 $orgConfig          = $results["Organization config"]
 $mailboxes          = $results["Mailboxes"]
@@ -496,6 +502,8 @@ $safeAttachments    = $results["Safe Attachments policies"]
 $sharingPolicies    = $results["Sharing policies"]
 $emailAddrPolicies  = $results["Email address policies"]
 $owaPolicies        = $results["OWA policies"]
+$antiPhishingPolicies = $results["Anti-phishing policies"]
+$atpPolicies        = $results["ATP policies"]
 #endregion
 
 
@@ -521,8 +529,8 @@ $summary = [pscustomobject]@{
     SharingPolicies = $sharingPolicies # All properties, all items
     EmailAddressPolicies = $emailAddrPolicies # All properties, all items
     OWAPolicies = $owaPolicies # All properties, all items
-    AntiPhishingPolicies = $results['Anti-phishing policies'] # All properties, all items
-    ATPPolicies = $results['ATP policies'] # All properties, all items
+    AntiPhishingPolicies = $antiPhishingPolicies # All properties, all items
+    ATPPolicies = $atpPolicies # All properties, all items
     DistributionGroups = $results['Distribution groups'] # All properties, all items
     UnifiedGroups = $results['Unified groups'] # All properties, all items
     ErrorCount = $global:ErrorCount
@@ -575,8 +583,8 @@ $compactSummary = [pscustomobject]@{
     SharingPolicies = $sharingPolicies | Select-Object -First 25 Name,Domains,Enabled,DefaultSharingPolicy
     EmailAddressPolicies = $emailAddrPolicies | Select-Object -First 25 Name,Enabled,RecipientFilter,Priority,EnabledEmailAddressTemplates
     OWAPolicies = $owaPolicies | Select-Object -First 25 Name,IsDefault,InstantMessagingType,DefaultTheme,LogonPagePublicPrivateSelectionEnabled
-    AntiPhishingPolicies = $results['Anti-phishing policies'] | Select-Object -First 25 Name,Enabled,Action,IsDefault,AuthenticationMethods
-    ATPPolicies = $results['ATP policies'] | Select-Object -First 25 Name,IsEnabled,Action,RedirectUrl,IsDefault
+    AntiPhishingPolicies = $antiPhishingPolicies | Select-Object -First 25 Name,Enabled,Action,IsDefault,AuthenticationMethods
+    ATPPolicies = $atpPolicies | Select-Object -First 25 Name,IsEnabled,Action,RedirectUrl,IsDefault
     DistributionGroupsSummary = [pscustomobject]@{
         TotalCount = (Get-SafeCount $results['Distribution groups'])
         Sample = ($results['Distribution groups'] | Select-Object -First 75 @{Name='GroupName';Expression={$_.Group.DisplayName}},@{Name='MemberCount';Expression={($_.Members | Measure-Object).Count}},@{Name='Members';Expression={($_.Members | Select-Object -First 10 DisplayName,PrimarySmtpAddress)}})
@@ -615,13 +623,13 @@ if ($Compact) {
             AntiMalware = (Get-SafeCount $antiMalware)
             SafeLinks = (Get-SafeCount $safeLinks)
             SafeAttachments = (Get-SafeCount $safeAttachments)
-            AntiPhishing = (Get-SafeCount $results['Anti-phishing policies'])
+            AntiPhishing = (Get-SafeCount $antiPhishingPolicies)
         }
         CriticalCategories = @{
             OrganizationConfigured = ($null -ne $orgConfig)
             MailboxesCollected = ($null -ne $mailboxes)
             DomainsConfigured = (Get-SafeCount $acceptedDomains)
-            SecurityPoliciesActive = @($antiSpam, $antiMalware, $results['Anti-phishing policies'], $results['ATP policies'] | Where-Object { $null -ne $_ }).Count
+            SecurityPoliciesActive = @($antiSpam, $antiMalware, $antiPhishingPolicies, $atpPolicies | Where-Object { $null -ne $_ }).Count
         }
     }
     $ultraCompactFile = Join-Path $OutputDir ("exo_summary_{0}_{1}_ultra-compact.json" -f $sanitizedDomain, $timestamp)
@@ -642,15 +650,24 @@ Write-Host "  Output Directory: $OutputDir" -ForegroundColor Cyan
 Write-Host "  Collected:       $((Get-Date).ToString('o'))" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "GENERATED FILES:" -ForegroundColor Yellow
-Write-Host "  ✓ Full Summary:          exo_summary_${sanitizedDomain}_${timestamp}.json" -ForegroundColor Green
-Write-Host "    (Complete detailed data - use for full analysis/archiving)" -ForegroundColor DarkGray
+if ($global:ExportMetadata["Summary"]) {
+    $file = Split-Path -Leaf $global:ExportMetadata["Summary"].File
+    Write-Host "  ✓ Full Summary:          $file" -ForegroundColor Green
+    Write-Host "    (Complete detailed data - use for full analysis/archiving)" -ForegroundColor DarkGray
+}
 Write-Host ""
-Write-Host "  ✓ Compact Summary:       exo_summary_${sanitizedDomain}_${timestamp}_compact.json" -ForegroundColor Green
-Write-Host "    (AI-optimized for smaller models - ~256KB, richer context)" -ForegroundColor DarkGray
+if ($global:ExportMetadata["CompactSummary"]) {
+    $file = Split-Path -Leaf $global:ExportMetadata["CompactSummary"].File
+    Write-Host "  ✓ Compact Summary:       $file" -ForegroundColor Green
+    Write-Host "    (AI-optimized for smaller models - ~256KB, richer context)" -ForegroundColor DarkGray
+}
 if ($Compact) {
-    Write-Host ""
-    Write-Host "  ✓ Ultra-Compact:         exo_summary_${sanitizedDomain}_${timestamp}_ultra-compact.json" -ForegroundColor Green
-    Write-Host "    (Single-page summary - ~5KB, instant analysis)" -ForegroundColor DarkGray
+    if ($global:ExportMetadata["UltraCompactSummary"]) {
+        Write-Host ""
+        $file = Split-Path -Leaf $global:ExportMetadata["UltraCompactSummary"].File
+        Write-Host "  ✓ Ultra-Compact:         $file" -ForegroundColor Green
+        Write-Host "    (Single-page summary - ~5KB, instant analysis)" -ForegroundColor DarkGray
+    }
 }
 Write-Host ""
 Write-Stat "  Total Categories Collected: $total"
